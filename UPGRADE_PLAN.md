@@ -18,8 +18,9 @@
 | 语言 | JavaScript | TypeScript（strict 模式） |
 | 编辑器内核 | Quill + y-quill | TipTap (ProseMirror) + @tiptap/extension-collaboration |
 | 实时通道 | Socket.IO + Yjs WebSocket 双通道 | 纯 Yjs WebSocket（单通道，更简洁） |
-| 持久化 | 内存 | 磁盘文件（.ydoc 二进制 + .meta.json） |
-| 版本历史 | 无 | Yjs snapshot 快照 + 恢复 |
+| 持久化 | 内存 | MongoDB（文档 CRDT + 元数据 + 用户 + 协作权限） |
+| 版本历史 | 无 | Yjs snapshot 快照 + 恢复（存储在 MongoDB） |
+| 用户系统 | 无（随机用户名） | 预留 users + collaborations schema（阶段二），后续实现注册登录 |
 | React | 19 | 18（TipTap 生态兼容性更好） |
 
 ## 保留的 collaborative-text-editor 功能
@@ -374,133 +375,424 @@ server.listen(PORT, () => {
 
 ---
 
-## 阶段二：磁盘持久化 + 版本历史
+## 阶段二：MongoDB 持久化 + 版本历史 + 用户 schema 预留
 
-### 2.1 磁盘持久化（从 google-docs-crdt 移植 + 修复）
+### 2.0 MongoDB 数据库设计
 
-#### 2.1.1 服务端持久化层
+#### 2.0.1 环境准备
+
+- 本地 MongoDB（`mongodb://localhost:27017`）
+- 数据库名：`collaborative_docs`
+- 服务端新增依赖：`mongodb`（官方 Node.js 驱动）
+
+#### 2.0.2 Collection 设计
+
+**`users`（用户——阶段二仅预留 schema，不实现注册登录）**
+
+```typescript
+interface UserDoc {
+  _id: ObjectId
+  username: string           // 唯一用户名
+  email: string              // 邮箱（唯一，预留）
+  passwordHash: string       // 密码哈希（预留，阶段二不填充）
+  displayName: string        // 显示名称
+  avatarColor: string        // 头像颜色
+  createdAt: Date
+  updatedAt: Date
+}
+// 索引: { username: 1 } unique, { email: 1 } unique sparse
+```
+
+**`documents`（文档——核心集合）**
+
+```typescript
+interface DocumentDoc {
+  _id: ObjectId
+  docId: string              // Yjs room name（唯一，用作 WebSocket 路由）
+  title: string              // 文档标题
+  ownerUserId: ObjectId | null  // 所有者（阶段二为 null，后续认证实现后填充）
+  crdtState: Buffer          // Y.encodeStateAsUpdate(doc) 的二进制数据
+  crdtStateSize: number      // crdtState.length（便于查询统计）
+  updateCount: number        // 更新次数（每次保存递增）
+  createdAt: Date
+  updatedAt: Date
+}
+// 索引: { docId: 1 } unique, { ownerUserId: 1 }, { updatedAt: -1 }
+```
+
+**`collaborations`（协作者权限——阶段二仅预留 schema）**
+
+```typescript
+interface CollaborationDoc {
+  _id: ObjectId
+  documentId: ObjectId       // 关联 documents._id
+  userId: ObjectId           // 协作者用户 ID
+  role: 'owner' | 'editor' | 'viewer'  // 权限角色
+  invitedAt: Date
+  acceptedAt: Date | null
+}
+// 索引: { documentId: 1, userId: 1 } unique
+```
+
+**`snapshots`（版本历史快照）**
+
+```typescript
+interface SnapshotDoc {
+  _id: ObjectId
+  documentId: ObjectId       // 关联 documents._id
+  name: string               // 快照名称（用户命名）
+  crdtState: Buffer          // Y.encodeStateAsUpdate(doc) 的完整 CRDT 状态
+  crdtStateSize: number
+  authorUserId: ObjectId | null  // 创建者（阶段二为 null）
+  authorName: string         // 创建者显示名（冗余，阶段二从 awareness 获取）
+  preview: string            // 文本预览（前 120 字符）
+  createdAt: Date
+}
+// 索引: { documentId: 1, createdAt: -1 }
+```
+
+#### 2.0.3 为什么用 MongoDB 而非磁盘文件
+
+| 对比 | 磁盘文件（google-docs-crdt 方案） | MongoDB |
+|---|---|---|
+| 查询能力 | 只能遍历目录 | 支持索引、条件查询、分页 |
+| 并发安全 | 无文件锁，需自己处理 | 数据库级并发控制 |
+| 扩展性 | 单机 | 可副本集、分片 |
+| 用户系统 | 无法关联 | 天然支持关联查询 |
+| 版本历史 | 需额外管理文件 | 一个 collection 搞定 |
+| 后续认证 | 需另建数据库 | 同库即可 |
+
+### 2.1 MongoDB 持久化层
+
+#### 2.1.1 数据库连接
+
+**新建文件**: `server/src/db.ts`
+
+```typescript
+import { MongoClient, Db } from 'mongodb'
+
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017'
+const DB_NAME = process.env.DB_NAME || 'collaborative_docs'
+
+let dbInstance: Db | null = null
+
+export async function connectDB(): Promise<Db> {
+  if (dbInstance) return dbInstance
+
+  const client = new MongoClient(MONGO_URI)
+  await client.connect()
+  dbInstance = client.db(DB_NAME)
+
+  // 创建索引（幂等操作）
+  await dbInstance.collection('users').createIndex({ username: 1 }, { unique: true })
+  await dbInstance.collection('users').createIndex({ email: 1 }, { unique: true, sparse: true })
+  await dbInstance.collection('documents').createIndex({ docId: 1 }, { unique: true })
+  await dbInstance.collection('documents').createIndex({ updatedAt: -1 })
+  await dbInstance.collection('collaborations').createIndex(
+    { documentId: 1, userId: 1 }, { unique: true }
+  )
+  await dbInstance.collection('snapshots').createIndex({ documentId: 1, createdAt: -1 })
+
+  console.log(`[db] Connected to MongoDB: ${DB_NAME}`)
+  return dbInstance
+}
+
+export function getDB(): Db {
+  if (!dbInstance) throw new Error('Database not connected. Call connectDB() first.')
+  return dbInstance
+}
+```
+
+#### 2.1.2 文档持久化服务
 
 **新建文件**: `server/src/persistence.ts`
 
-从 `google-docs-crdt/server/src/persistence.ts` 移植，修复以下问题：
-- `fs.writeFileSync` → `fs.promises.writeFile`（异步写入，不阻塞事件循环）
-- `ydoc.on('update')` 监听器泄漏 → 在 `writeState` 回调中清理
-- 添加 debounce timer 清理逻辑
-
 ```typescript
-import * as fs from 'fs'
-import * as path from 'path'
 import * as Y from 'yjs'
+import { getDB } from './db'
+import type { DocumentDoc, SnapshotDoc } from './types'
 
-const STORAGE_DIR = path.resolve(__dirname, '../storage')
-
-// 确保存储目录存在
-if (!fs.existsSync(STORAGE_DIR)) {
-  fs.mkdirSync(STORAGE_DIR, { recursive: true })
-}
-
-interface DocumentMetadata {
-  id: string
-  title: string
-  createdAt: string
-  updatedAt: string
-  updateCount: number
-}
-
+const DEBOUNCE_MS = 1000
 const writeDebounceTimers = new Map<string, NodeJS.Timeout>()
 
-export class DiskPersistence {
-  // ... 移植自 google-docs-crdt，修复异步写入和监听器泄漏
+// y-websocket 持久化接口
+export const mongoPersistence = {
+  // 文档首次加载时调用——从 MongoDB 读取 CRDT 状态
+  bindState: async (docName: string, ydoc: Y.Doc): Promise<void> => {
+    const db = getDB()
+    const doc = await db.collection<DocumentDoc>('documents').findOne({ docId: docName })
+
+    if (doc && doc.crdtState) {
+      Y.applyUpdate(ydoc, new Uint8Array(doc.crdtState.buffer))
+    } else {
+      // 新文档——创建记录
+      await db.collection<DocumentDoc>('documents').insertOne({
+        docId: docName,
+        title: docName === 'default' ? 'Untitled Document' : docName,
+        ownerUserId: null,
+        crdtState: Buffer.alloc(0),
+        crdtStateSize: 0,
+        updateCount: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+    }
+
+    // 监听更新，debounce 写入 MongoDB
+    ydoc.on('update', (update: Uint8Array) => {
+      scheduleSave(docName, ydoc)
+    })
+  },
+
+  // 文档所有连接断开时调用——立即写入
+  writeState: async (docName: string, ydoc: Y.Doc): Promise<void> => {
+    const timer = writeDebounceTimers.get(docName)
+    if (timer) {
+      clearTimeout(timer)
+      writeDebounceTimers.delete(docName)
+    }
+    await saveImmediate(docName, ydoc)
+  },
+}
+
+async function scheduleSave(docName: string, ydoc: Y.Doc): Promise<void> {
+  const existing = writeDebounceTimers.get(docName)
+  if (existing) clearTimeout(existing)
+
+  const timer = setTimeout(() => {
+    saveImmediate(docName, ydoc)
+    writeDebounceTimers.delete(docName)
+  }, DEBOUNCE_MS)
+
+  writeDebounceTimers.set(docName, timer)
+}
+
+async function saveImmediate(docName: string, ydoc: Y.Doc): Promise<void> {
+  const db = getDB()
+  const stateUpdate = Y.encodeStateAsUpdate(ydoc)
+  const stateBuffer = Buffer.from(stateUpdate)
+
+  await db.collection<DocumentDoc>('documents').updateOne(
+    { docId: docName },
+    {
+      $set: {
+        crdtState: stateBuffer,
+        crdtStateSize: stateBuffer.length,
+        updatedAt: new Date(),
+      },
+      $inc: { updateCount: 1 },
+      $setOnInsert: {
+        title: docName,
+        ownerUserId: null,
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true }
+  )
 }
 ```
 
-#### 2.1.2 服务端集成持久化
+#### 2.1.3 REST API 端点
+
+**文件**: `server/src/server.ts`（在阶段一基础上扩展）
+
+```typescript
+// 列出所有文档
+app.get('/api/documents', async (_req, res) => {
+  const db = getDB()
+  const docs = await db.collection('documents')
+    .find({}, { projection: { crdtState: 0 } })  // 不返回大二进制
+    .sort({ updatedAt: -1 })
+    .toArray()
+  res.json(docs)
+})
+
+// 获取文档元数据
+app.get('/api/documents/:docId/metadata', async (req, res) => {
+  const db = getDB()
+  const doc = await db.collection('documents').findOne(
+    { docId: req.params.docId },
+    { projection: { crdtState: 0 } }
+  )
+  res.json(doc || { error: 'Not found' })
+})
+
+// 更新文档标题
+app.patch('/api/documents/:docId/metadata', async (req, res) => {
+  const db = getDB()
+  await db.collection('documents').updateOne(
+    { docId: req.params.docId },
+    { $set: { title: req.body.title, updatedAt: new Date() } }
+  )
+  res.json({ status: 'ok' })
+})
+
+// 删除文档
+app.delete('/api/documents/:docId', async (req, res) => {
+  const db = getDB()
+  await db.collection('documents').deleteOne({ docId: req.params.docId })
+  await db.collection('snapshots').deleteMany({ documentId: ... })
+  res.json({ status: 'ok' })
+})
+
+// 版本历史——创建快照
+app.post('/api/documents/:docId/snapshots', async (req, res) => {
+  const db = getDB()
+  const doc = await db.collection('documents').findOne({ docId: req.params.docId })
+  if (!doc) return res.status(404).json({ error: 'Document not found' })
+
+  const snapshot = {
+    documentId: doc._id,
+    name: req.body.name || `Revision ${Date.now()}`,
+    crdtState: doc.crdtState,       // 复制当前 CRDT 状态
+    crdtStateSize: doc.crdtStateSize,
+    authorUserId: null,
+    authorName: req.body.author || 'Anonymous',
+    preview: req.body.preview || '',
+    createdAt: new Date(),
+  }
+  await db.collection('snapshots').insertOne(snapshot)
+  res.json({ status: 'ok', id: snapshot._id })
+})
+
+// 版本历史——列出快照
+app.get('/api/documents/:docId/snapshots', async (req, res) => {
+  const db = getDB()
+  const doc = await db.collection('documents').findOne({ docId: req.params.docId })
+  if (!doc) return res.json([])
+
+  const snapshots = await db.collection('snapshots')
+    .find({ documentId: doc._id }, { projection: { crdtState: 0 } })
+    .sort({ createdAt: -1 })
+    .toArray()
+  res.json(snapshots)
+})
+
+// 版本历史——恢复到指定快照
+app.post('/api/snapshots/:snapshotId/restore', async (req, res) => {
+  const db = getDB()
+  const snapshot = await db.collection('snapshots').findOne({ _id: new ObjectId(req.params.snapshotId) })
+  if (!snapshot) return res.status(404).json({ error: 'Snapshot not found' })
+
+  // 返回快照的 CRDT 状态，客户端 applyUpdate
+  res.json({ crdtState: Array.from(snapshot.crdtState) })
+})
+```
+
+#### 2.1.4 服务端集成
 
 **文件**: `server/src/server.ts`
 
-- 添加 `setPersistence` 到 y-websocket 的 `setupWSConnection`
-- 添加 REST API 端点:
-  - `GET /api/documents`——列出所有文档
-  - `GET /api/documents/:id/metadata`——获取文档元数据
-  - `PATCH /api/documents/:id/metadata`——更新文档标题
+- 启动时调用 `connectDB()`
+- 将 `mongoPersistence` 传给 y-websocket 的 `setPersistence`
+- 添加 `express.json()` 中间件（解析 PATCH/POST body）
 
-#### 2.1.3 客户端适配
+#### 2.1.5 客户端适配
 
 **文件**: `client/src/components/DocsPage.tsx`
 
-- 文档列表从 localStorage 改为调用 `GET /api/documents`（同时保留 localStorage 作为离线缓存）
-- 文档创建/删除时同步到服务端
+- 文档列表从 `GET /api/documents` 获取（替代纯 localStorage）
+- localStorage 保留作为离线缓存（API 失败时 fallback）
+- 文档创建/删除时同步到服务端 API
 
-### 2.2 版本历史（从 google-docs-crdt 移植 + 修复）
-
-#### 2.2.1 修复方案
-
-google-docs-crdt 的版本历史只存元数据，不能恢复。修复方案：
-- 使用 Yjs 的 `Y.encodeStateAsUpdate(doc)` 保存完整 CRDT 状态
-- 存储位置：IndexedDB（客户端本地，因为版本历史是个人操作记录）
-- 添加恢复功能：`Y.applyUpdate(doc, snapshot)` 将文档回滚到指定版本
-
-#### 2.2.2 客户端版本历史服务
-
-**新建文件**: `client/src/services/versionHistory.ts`
+**文件**: `client/src/services/api.ts`（新建）
 
 ```typescript
-import * as Y from 'yjs'
-import { getDoc, setDoc } from 'idb-keyval' // 或直接用 IndexedDB API
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
 
-export interface VersionSnapshot {
-  id: string
-  name: string
-  timestamp: number
-  author: string
-  crdtBytes: Uint8Array  // 完整 CRDT 状态（关键修复）
-  preview: string
-}
-
-// 保存快照
-export async function createSnapshot(doc: Y.Doc, name: string, author: string): Promise<VersionSnapshot>
-
-// 加载快照列表
-export async function listSnapshots(roomName: string): Promise<VersionSnapshot[]>
-
-// 恢复到指定版本
-export async function restoreSnapshot(snapshot: VersionSnapshot, doc: Y.Doc): Promise<void>
+export async function fetchDocuments(): Promise<DocumentMeta[]>
+export async function createDocument(name: string): Promise<DocumentMeta>
+export async function deleteDocument(docId: string): Promise<void>
+export async function updateDocumentTitle(docId: string, title: string): Promise<void>
+export async function createSnapshot(docId: string, name: string, author: string): Promise<void>
+export async function listSnapshots(docId: string): Promise<SnapshotMeta[]>
+export async function restoreSnapshot(snapshotId: string): Promise<Uint8Array>
 ```
 
-#### 2.2.3 版本历史 UI
+### 2.2 版本历史
+
+#### 2.2.1 版本历史 UI
 
 **新建文件**: `client/src/components/VersionHistoryModal.tsx`
 
-- 从 google-docs-crdt 移植 UI 结构
-- 添加"恢复到此版本"按钮
-- 样式适配现有设计系统（不用 google-docs-crdt 的白色主题，适配 collaborative-text-editor 的风格）
+- 从 google-docs-crdt 移植 UI 结构，修复问题：
+  - **存储在 MongoDB 而非 localStorage**——快照跨设备共享
+  - **存储完整 CRDT 状态**——可以真正恢复（google-docs-crdt 只存元数据）
+  - **添加"恢复到此版本"按钮**——调用 restore API，客户端 `Y.applyUpdate`
+  - 样式适配现有设计系统
+
+#### 2.2.2 恢复流程
+
+```
+用户点击"恢复" → POST /api/snapshots/:id/restore
+                     → 服务端返回 crdtState (Uint8Array)
+                 → 客户端 Y.applyUpdate(doc, crdtState)
+                     → TipTap Collaboration 扩展自动更新编辑器
+                     → 变更通过 Yjs WebSocket 同步到其他协作者
+```
 
 ### 2.3 阶段二验收标准
 
-- [ ] 服务端重启后文档内容不丢失
+- [ ] MongoDB 连接成功，4 个 collection 创建且有索引
+- [ ] 服务端重启后文档内容不丢失（从 MongoDB 恢复）
 - [ ] `GET /api/documents` 返回正确的文档列表
-- [ ] 文档标题更新同步到服务端
+- [ ] 文档标题更新同步到 MongoDB
+- [ ] 文档删除时 MongoDB 中的记录和关联快照一并删除
 - [ ] 版本历史模态框正常显示
-- [ ] 可以创建命名快照
-- [ ] 可以恢复到之前的版本（文档内容实际回滚）
-- [ ] 快照存储在 IndexedDB 中，刷新页面不丢失
+- [ ] 可以创建命名快照（CRDT 状态完整存入 MongoDB）
+- [ ] 可以恢复到之前的版本（文档内容实际回滚 + 同步到其他协作者）
+- [ ] 快照列表从 MongoDB 获取，跨设备一致
+- [ ] users 和 collaborations 集合存在（空集合，为阶段三预留）
 
 ---
 
-## 阶段三：大文档分块传输 + 收尾优化（后续）
+## 阶段三：用户认证 + 大文档分块 + 收尾优化
 
-### 3.1 大文档分块传输
+### 3.1 用户注册登录（JWT）
+
+#### 3.1.1 服务端认证
+
+**新建文件**: `server/src/auth.ts`
+
+- `POST /api/auth/register`——用户注册（用户名 + 密码，bcrypt 哈希）
+- `POST /api/auth/login`——用户登录，返回 JWT token
+- `GET /api/auth/me`——获取当前用户（验证 JWT）
+- JWT middleware——解析 Authorization header，验证 token，注入 `req.user`
+- 依赖新增：`bcryptjs`, `jsonwebtoken`
+
+#### 3.1.2 客户端认证
+
+**新建文件**: `client/src/contexts/AuthContext.tsx`
+
+- 提供 `useAuth()` hook
+- 管理 token（localStorage 存储）
+- 登录/注册/登出方法
+- 自动在 API 请求 header 中附加 JWT
+
+**新建文件**: `client/src/components/LoginPage.tsx`, `client/src/components/RegisterPage.tsx`
+
+- 登录/注册页面
+- 路由守卫：未登录跳转登录页
+
+#### 3.1.3 协作权限
+
+- 文档创建时 `ownerUserId` 设为当前用户
+- `collaborations` 集合开始写入：owner 自动获得 `owner` 角色
+- 编辑器进入时检查用户是否有该文档的访问权限
+- 后续：分享文档、邀请协作者、权限管理 UI
+
+### 3.2 大文档分块传输
 
 - 评估 TipTap + Yjs 在大文档场景下的性能
 - 如有需要，在 Yjs WebSocket 层实现分块传输（替代原 Socket.IO 方案）
 
-### 3.2 代码质量
+### 3.3 代码质量
 
 - ESLint + Prettier 配置
 - 移除所有 `any` 类型
 - 添加关键模块的单元测试
 
-### 3.3 文档
+### 3.4 文档
 
 - 更新 README.md
 - 添加架构图
@@ -568,9 +860,24 @@ collaborative-text-editor 的 README 明确提到不用 StrictMode（会导致 Y
 
 | 操作 | 文件路径 |
 |---|---|
-| 新建 | `server/src/persistence.ts` |
-| 新建 | `client/src/services/versionHistory.ts` |
+| 新建 | `server/src/db.ts`（MongoDB 连接 + 索引） |
+| 新建 | `server/src/persistence.ts`（MongoDB Yjs 持久化层） |
+| 新建 | `server/src/types.ts`（DocumentDoc, SnapshotDoc, UserDoc, CollaborationDoc 接口） |
+| 修改 | `server/src/server.ts`（集成 MongoDB 持久化 + REST API） |
+| 修改 | `server/package.json`（新增 `mongodb` 依赖） |
+| 新建 | `client/src/services/api.ts`（REST API 客户端） |
 | 新建 | `client/src/components/VersionHistoryModal.tsx` |
-| 修改 | `server/src/server.ts`（集成持久化） |
 | 修改 | `client/src/components/Editor.tsx`（添加版本历史入口） |
-| 修改 | `client/src/components/DocsPage.tsx`（文档列表从服务端获取） |
+| 修改 | `client/src/components/DocsPage.tsx`（文档列表从 MongoDB 获取） |
+| 修改 | `client/src/types/index.ts`（新增 SnapshotMeta 等类型） |
+
+### 阶段三新增
+
+| 操作 | 文件路径 |
+|---|---|
+| 新建 | `server/src/auth.ts`（JWT 认证中间件 + 注册登录接口） |
+| 新建 | `client/src/contexts/AuthContext.tsx` |
+| 新建 | `client/src/components/LoginPage.tsx` |
+| 新建 | `client/src/components/RegisterPage.tsx` |
+| 修改 | `client/src/App.tsx`（添加路由守卫） |
+| 修改 | `server/src/server.ts`（认证路由 + 权限检查） |
