@@ -3,16 +3,84 @@
 ## 执行顺序
 
 ```
-Step 1: 服务端 TypeScript 化（后端先就绪，前端才有东西可连）
-Step 2: 客户端基础设施（package.json, tsconfig, vite.config）
-Step 3: 客户端类型定义 + 工具函数迁移
-Step 4: 客户端服务层迁移（yjsProvider, storage）
-Step 5: 客户端编辑器组件（EditorToolbar + Editor 重写）
-Step 6: 客户端其他组件迁移（DocsPage, App, main）
-Step 7: CSS 适配（Quill → TipTap）
-Step 8: 删除旧 .jsx/.js 文件
-Step 9: 安装依赖 + 编译验证 + 运行测试
+┌─ 阶段 A：后端独立迁移 ──────────────────────────────────────
+│  Step 1: 服务端 TypeScript 化（新建 tsconfig, server.ts, 改 package.json）
+│    ✅ 验证点 V1: 后端独立运行——npm install + npx tsc --noEmit + npm run dev
+│    → 后端 /health 返回 200，Yjs WebSocket upgrade 正常
+│    → 此时前端仍是旧代码，Socket.IO 会连接失败（预期行为）
+│
+├─ 阶段 B：前端整体迁移（Step 2-8 一口气做完）─────────────
+│  Step 2: 客户端基础设施（package.json, tsconfig, vite.config）
+│  Step 3: 客户端类型定义 + 工具函数迁移
+│  Step 4: 客户端服务层迁移（yjsProvider, storage）
+│  Step 5: 客户端编辑器组件（EditorToolbar + Editor 重写）
+│  Step 6: 客户端其他组件迁移（DocsPage, App, main）
+│  Step 7: CSS 适配（Quill → TipTap）
+│  Step 8: 删除旧 .jsx/.js 文件
+│    ✅ 验证点 V2: 编译验证——cd client && npm install && npx tsc --noEmit
+│    → TypeScript 编译零错误，所有类型正确
+│    ✅ 验证点 V3: 运行验证——npm run dev + 打开 http://localhost:5173
+│    → 按 9.4 功能验证清单逐项检查
+│
+└─ 阶段 A/B 之间和 B 内部的验证策略 ─────────────────────
+   • Step 1 之后：后端可独立验证（V1），前端不动
+   • Step 2-7：每完成一个 Step 可运行 `npx tsc --noEmit` 做类型检查（T 检查）
+     - T2: Step 2 后（检查 tsconfig 配置无误）
+     - T3: Step 3 后（检查类型定义）
+     - T4: Step 4 后（检查 yjsProvider + storage）
+     - T5: Step 5 后（检查 Editor + EditorToolbar）
+     - T6: Step 6 后（检查 DocsPage + App + main）
+     - T7: Step 7 后（CSS 不影响 tsc，跳过）
+   • Step 8 之后：完整验证（V2 编译 + V3 运行）
+   • ⚠️ Step 2-7 期间前端网页不可运行——旧 package.json 卸载了 Quill/Socket.IO
+     但新 .tsx 还在 import TipTap，npm install 前 Vite 会报错。这是"大爆炸"迁
+     移的固有代价，用 tsc --noEmit 在每步后做类型检查来提前发现问题。
 ```
+
+---
+
+## 来自 docs 项目的架构借鉴
+
+在分析 `thirdparty/docs`（La Suite Docs，法德政府联合开发的开源协作文档编辑器，v5.7.0）后，提取了以下值得在本项目落地的架构模式。阶段一在类型定义和服务端骨架中**预留衔接点**，后续阶段按需启用。
+
+### 借鉴 1：`get_abilities()` 契约模式
+
+**docs 的做法**：每个模型（Document、User 等）的序列化方法返回一个 `abilities` 字段——约 30 个布尔值，描述当前用户对该对象的能力（`can_edit`, `can_delete`, `can_share`, `can_comment`, `can_view_version_history` 等）。前端直接消费这些布尔值决定 UI 显示/隐藏，**不需要前端自己判断权限**。
+
+**为什么值得学习**：权限逻辑集中在后端，前端只做展示。当权限规则变化时只改后端，前端 UI 自动跟随。这避免了"前端硬编码角色判断、后端规则一变前端就跟不上"的常见反模式。
+
+**阶段一落地**：在 `types/index.ts` 中**预留 `DocumentAbilities` 接口骨架**（字段留空或注释 TODO），阶段一不填充真实值，所有能力默认 `true`（单用户无权限控制）。阶段三实现用户认证、阶段四实现权限系统时，由后端在文档序列化时返回真实能力值，前端 UI 绑定到这些布尔值。
+
+### 借鉴 2：文档内容与元数据分离
+
+**docs 的做法**：CRDT 二进制内容存 S3 对象存储（带版本化），PostgreSQL 只存文档**元数据**（标题、树结构、RBAC、时间戳）。两者通过 `doc_id` 关联。
+
+**为什么值得学习**：二进制 CRDT state 可能很大（MB 级），放关系数据库会拖慢查询和索引。元数据表保持轻量，可以建索引、做 JOIN、分页查询；二进制内容走对象存储，天然支持版本化和大文件。
+
+**阶段一落地**：本项目阶段二用 MongoDB，`documents` 集合存元数据 + `crdtState`（Buffer）。阶段一在 `DocumentMeta` 类型中**预留 `parentId`（文档树）和 `deletedAt`（软删除）字段**，为后续文档树和回收站功能做准备。当 CRDT 增长到一定规模或引入版本历史时，可以将 `crdtState` 迁移到 GridFS 或外部对象存储，`documents` 集合只保留元数据——这个分离点在类型设计阶段就预留好。
+
+### 借鉴 3：协作连接生命周期管理
+
+**docs 的做法**：用 HocusPocus（Yjs 增强服务器）替代裸 y-websocket，在 `onConnect` 钩子验证用户 token + 文档权限，在 `onDisconnect` 清理资源，权限变更时调用 `reset-connections` 强制重连以应用新权限。
+
+**阶段一落地**：本项目阶段一继续用裸 y-websocket（无认证无权限），但在 `server.ts` 的 upgrade 处理处**预留注释钩子**，标注未来在此处插入 token 验证和权限检查。阶段三/四接入用户系统时，可以平滑升级到 HocusPocus 或在 upgrade handler 中加中间件，而不需要重新设计连接链路。
+
+### 借鉴 4：软删除 + 文档树结构
+
+**docs 的做法**：文档删除是软删除（设置 `deleted_at` 时间戳），可在回收站恢复。文档有 `parent_id` 形成树结构，子文档继承父文档的权限且只能收窄。
+
+**阶段一落地**：`DocumentMeta` 类型预留 `deletedAt` 和 `parentId` 字段，阶段一不实现相关功能（localStorage 的文档管理保持原样），但类型层面已经就绪，后续阶段接入 MongoDB 时可以直接启用。
+
+### 后续阶段路线图（与 docs 对齐）
+
+| 阶段 | 目标 | 对应 docs 的能力 |
+|---|---|---|
+| 阶段一（本计划） | TS + TipTap + 纯 Yjs WebSocket | 基础编辑 + 协作 |
+| 阶段二 | MongoDB 持久化 + 版本历史 | documents/snapshots 集合 |
+| 阶段三 | 用户注册登录 + 文档归属 | users 集合 + onConnect 认证 |
+| 阶段四 | RBAC 权限系统 + 分享邀请 | `get_abilities()` 契约 + collaborations 集合 |
+| 阶段五 | 评论系统 | comments 集合 |
+| 阶段六 | 文档树 + 软删除回收站 + 收藏夹 | parentId + deletedAt 字段启用 |
 
 ---
 
@@ -191,6 +259,28 @@ server.on('upgrade', (request, socket, head) => {
   - `io.on('connection', ...)` — 整个事件处理块（join-document, send-changes, save-document, disconnect）全部删除
   - Socket.IO 的 CORS 配置 — 删除
 
+> **来自 docs 项目的架构借鉴 — 协作连接生命周期管理**：
+>
+> docs 项目用 HocusPocus 替代裸 y-websocket，在 `onConnect` 钩子验证用户 token + 文档权限。本项目阶段一无认证无权限，但 upgrade handler 是未来插入认证的衔接点：
+>
+> ```typescript
+> // ── 阶段三/四预留：在此处插入认证钩子 ──
+> server.on('upgrade', (request, socket, head) => {
+>   const pathname = new URL(request.url, 'http://x').pathname
+>   if (pathname.startsWith('/yjs')) {
+>     // TODO(阶段三): 从 request.headers 提取 token，验证用户身份
+>     // TODO(阶段四): 从 URL 提取 docName，查询用户对该文档的权限
+>     //               如果无权限 → socket.destroy() 拒绝连接
+>     //               如果有权限 → wss.handleUpgrade(...)
+>     wss.handleUpgrade(request, socket, head, (ws) => {
+>       wss.emit('connection', ws, request)
+>     })
+>   }
+> })
+> ```
+>
+> 此外，docs 在权限变更时调用 `reset-connections` 强制客户端重连以应用新权限。阶段四实现权限系统时，可以在服务端维护一个 `docId → Set<ws>` 映射，权限变更时关闭对应文档的所有 WebSocket 连接，客户端 WebsocketProvider 会自动重连并重新走认证流程。阶段一不需要实现这个机制，但了解这个模式有助于后续架构决策。
+
 #### 1.3.4 移除内存文档存储
 
 **整段删除**:
@@ -294,6 +384,25 @@ process.on('SIGINT', () => shutdown('SIGINT'))
 ### 1.4 删除 `server/index.js`
 
 在 `server/src/server.ts` 验证可运行后删除原文件。
+
+### ✅ 验证点 V1：后端独立验证
+
+完成 Step 1 后，后端可以独立运行和验证：
+
+```bash
+cd server
+npm install              # 安装 TS 工具链 + 新依赖
+npx tsc --noEmit       # 类型检查（应零错误）
+npm run dev             # 启动：ts-node src/server.ts → http://localhost:3001
+```
+
+验证清单：
+- [ ] `npx tsc --noEmit` 零错误
+- [ ] `npm run dev` 后控制台输出 `[server] Running on http://localhost:3001`
+- [ ] 浏览器访问 `http://localhost:3001/health` 返回 `{"status":"ok",...}`
+- [ ]（可选）用 wscat 测试 WebSocket：`npx wscat -c ws://localhost:3001/yjs/test`，连接成功即说明 upgrade 路径正确
+
+> ⚠️ 此时前端仍是旧代码（Editor.jsx 仍用 Socket.IO），打开 http://localhost:5173 会有 Socket.IO 连接错误，**这是预期行为**——后端已移除 Socket.IO。不需要在此阶段验证前端。
 
 ---
 
@@ -478,6 +587,21 @@ export default defineConfig({
 
 同时需要安装 TypeScript ESLint 依赖（可选，阶段一可以先跳过 lint 配置，保证编译通过即可）。
 
+### 🔍 类型检查点 T2：配置验证
+
+完成 Step 2 后，可以验证 TS 配置是否正确（此时还没有 .ts 源码，只检查 tsconfig 语法）：
+
+```bash
+cd client
+# 先不 npm install（因为 package.json 已改为 TipTap 依赖，安装后旧 .jsx 会报错）
+# 只验证 tsconfig.json 语法是否正确
+npx --yes typescript@5.7.2 tsc --noEmit -p tsconfig.json 2>&1 | head -5
+# 预期：报 "No inputs were found" 或类似——因为 src/ 下还没有 .ts 文件，这是正常的
+# 如果报 "Cannot find module 'typescript'" 说明 tsconfig 解析有问题
+```
+
+> ⚠️ **不要在此阶段运行 `npm install`**——新 package.json 移除了 Quill/Socket.IO，但旧 .jsx 文件还在 import 它们。npm install 后 Vite 会启动失败。要等到 Step 8 删除旧文件后再 install。
+
 ---
 
 ## Step 3: 客户端类型定义 + 工具函数迁移
@@ -512,6 +636,10 @@ export interface DocumentMeta {
   name: string
   createdAt: number
   updatedAt: number
+  // ── 预留字段（来自 docs 项目的架构借鉴）──
+  parentId?: string | null         // 文档树结构：父文档 ID（阶段六启用）
+  deletedAt?: number | null        // 软删除时间戳（阶段六启用）
+  abilities?: DocumentAbilities    // 当前用户对该文档的能力契约（阶段四启用）
 }
 
 // 连接状态
@@ -522,6 +650,20 @@ export interface RemoteUserState {
   user: UserAwareness
   selection?: { from: number; to: number } | null
   docTitle?: string
+}
+
+// ── 预留：文档能力契约（来自 docs 项目的 get_abilities() 模式）──
+// 阶段四实现 RBAC 权限系统时，后端在文档序列化时返回这些布尔值，
+// 前端 UI 直接消费决定按钮/操作的显示与隐藏。
+// 阶段一所有能力默认 true（单用户无权限控制）。
+export interface DocumentAbilities {
+  canView?: boolean
+  canEdit?: boolean
+  canDelete?: boolean
+  canShare?: boolean
+  canComment?: boolean
+  canViewHistory?: boolean
+  // 后续可扩展更多能力字段...
 }
 ```
 
@@ -542,6 +684,22 @@ export const generateId = (name: string): string => {
 ```
 
 唯一变更：添加参数和返回值类型注解。
+
+### 🔍 类型检查点 T3：类型定义验证
+
+完成 Step 3 后，`types/index.ts` 和 `generateId.ts` 已创建。可以检查这两个文件的类型正确性：
+
+```bash
+cd client
+# 用 npx 临时安装 typescript 检查（不修改 node_modules）
+npx --yes typescript@5.7.2 tsc --noEmit --strict --moduleResolution bundler --jsx react-jsx \
+  src/types/index.ts src/utils/generateId.ts 2>&1
+# 预期：零错误。如果报 "Cannot find name" 说明有类型引用问题
+# 注意：yjs/y-websocket/y-indexeddb 的类型在此阶段可能找不到（未 npm install），
+#       可以加 --skipLibCheck 跳过库检查
+```
+
+> 此阶段网页仍不可运行。`types/index.ts` 是纯类型文件，不影响运行时；`generateId.ts` 逻辑简单，类型正确即可。
 
 ---
 
@@ -642,6 +800,8 @@ export function createYjs(
 - **新增 `destroy()` 方法** — 统一清理资源，替代 Editor.jsx 中分散的 cleanup 逻辑
 - **customUser 可选参数** — 后续用户认证实现后可以传入真实用户信息
 
+> **来自 docs 项目的架构借鉴**：docs 项目的 awareness 中除了 `name`/`color` 还携带 `user_id`，服务端在 `onConnect` 时从 awareness 或连接参数中提取用户身份做权限校验。本项目的 `customUser` 参数就是为此预留——阶段三实现登录后，`createYjs(docId, { id: loggedInUser.id, name: loggedInUser.name, color: loggedInUser.avatarColor })` 即可无缝接入，awareness 协议和 CollabSession 接口不需要改动。
+
 ### 4.2 `client/src/services/storage.js` → `storage.ts`
 
 **当前内容**:
@@ -679,6 +839,24 @@ export const saveDocs = (docs: DocumentMeta[]): void => {
 ```
 
 唯一变更：添加类型注解，过滤回调参数类型标注。逻辑完全不变。
+
+### 🔍 类型检查点 T4：服务层验证
+
+完成 Step 4 后，`yjsProvider.ts` 和 `storage.ts` 已创建。检查类型正确性：
+
+```bash
+cd client
+npx --yes typescript@5.7.2 tsc --noEmit --strict --moduleResolution bundler --jsx react-jsx \
+  --skipLibCheck \
+  src/types/index.ts src/utils/generateId.ts \
+  src/services/yjsProvider.ts src/services/storage.ts 2>&1
+# 预期：零错误（--skipLibCheck 跳过 yjs/y-websocket 库的类型声明检查）
+# 常见错误：
+#   - "Cannot find module 'yjs'" → 正常，未 npm install，加 --skipLibCheck 可跳过
+#   - "Property 'awareness' does not exist" → 检查 WebsocketProvider 类型导入
+```
+
+> ⚠️ 网页仍不可运行。`yjsProvider.ts` 依赖 yjs/y-websocket/y-indexeddb，这些包要等 Step 8 后 `npm install` 才真正可用。
 
 ---
 
@@ -1092,6 +1270,8 @@ useEffect(() => {
 - 添加了 TypeScript 类型注解
 - 从 `session.provider.awareness` 获取 awareness 实例（原来是 `provider.awareness`）
 
+> **来自 docs 项目的架构借鉴**：docs 项目的前端组件不自己判断权限，而是消费后端返回的 `abilities` 对象。本项目阶段一无权限控制，但 `Editor.tsx` 中的操作按钮（PDF/DOCX 导出、编辑/查看切换、标题编辑等）可以预留 `disabled={!abilities?.canEdit}` 这样的绑定点。阶段四实现权限系统后，这些按钮会自动根据后端返回的能力值启用/禁用，不需要改组件逻辑。阶段一可以先不做这个绑定（所有按钮始终可用），但了解这个模式有助于后续设计。
+
 #### 5.3.6 移除 Socket.IO 代码
 
 **整段删除**原 Editor.jsx 中的 Socket.IO 相关代码：
@@ -1406,6 +1586,27 @@ return (
 - `className="quill-wrapper"` → `className="tiptap-wrapper"`
 - 其他所有 JSX 结构（topbar, avatars, conn-badge, mode-btn, export buttons, typing indicator, word count）**保持不变**
 
+### 🔍 类型检查点 T5：编辑器组件验证
+
+完成 Step 5 后，`FontSize.ts`、`EditorToolbar.tsx`、`Editor.tsx` 已创建。这是最复杂的部分，务必做类型检查：
+
+```bash
+cd client
+npx --yes typescript@5.7.2 tsc --noEmit --strict --moduleResolution bundler --jsx react-jsx \
+  --skipLibCheck \
+  src/types/index.ts src/utils/generateId.ts \
+  src/services/yjsProvider.ts src/services/storage.ts \
+  src/extensions/FontSize.ts \
+  src/components/EditorToolbar.tsx src/components/Editor.tsx 2>&1
+# 预期：零错误
+# 常见错误：
+#   - "Property 'setFontSize' does not exist on type 'Commands'" → 检查 FontSize.ts 的 declare module
+#   - "Cannot find module '@tiptap/react'" → 正常，未 npm install，--skipLibCheck 可跳过
+#   - Editor.tsx 中 docx 的 TextRun 类型 → 可能需要 @types 或 any 断言
+```
+
+> ⚠️ 网页仍不可运行。Editor.tsx 是最复杂的文件（500+ 行），类型检查通过说明逻辑结构正确，但运行时行为要等 Step 8 后验证。
+
 ---
 
 ## Step 6: 其他组件迁移
@@ -1433,6 +1634,8 @@ const deleteDoc = (id: string): void => { ... }
 ```
 
 逻辑完全不变。没有 Socket.IO 引用需要移除（DocsPage 只用 localStorage）。
+
+> **来自 docs 项目的架构借鉴**：docs 的文档删除是软删除（设置 `deleted_at`），用户可在回收站恢复。本项目阶段一的 `deleteDoc` 仍然是硬删除（从 localStorage 移除），但 `DocumentMeta` 已预留 `deletedAt` 字段。阶段六实现回收站时，`deleteDoc` 改为设置 `deletedAt = Date.now()`，`getDocs` 过滤 `deletedAt != null` 的文档，新增回收站页面展示 `deletedAt != null` 的文档并提供恢复按钮——组件结构和类型定义已经就绪。
 
 ### 6.2 `client/src/App.jsx` → `App.tsx`
 
@@ -1473,6 +1676,25 @@ createRoot(document.getElementById('root')!).render(<App />)
 - `import App from './App.jsx'` → `import App from './App'`（TypeScript + bundler resolution 不需要扩展名）
 - `document.getElementById('root')` 添加 `!` 非空断言（TS strict 模式要求）
 - StrictMode 注释更新——TipTap 的 `useEditor` 比 Quill 更好地处理 StrictMode 双挂载，但继续保持不用
+
+### 🔍 类型检查点 T6：全量类型检查
+
+完成 Step 6 后，所有 .ts/.tsx 源文件已创建。可以做一次全量类型检查：
+
+```bash
+cd client
+npx --yes typescript@5.7.2 tsc --noEmit --strict --moduleResolution bundler --jsx react-jsx \
+  --skipLibCheck --esModuleInterop \
+  src/types/index.ts src/utils/generateId.ts \
+  src/services/yjsProvider.ts src/services/storage.ts \
+  src/extensions/FontSize.ts \
+  src/components/EditorToolbar.tsx src/components/Editor.tsx \
+  src/components/DocsPage.tsx src/App.tsx src/main.tsx 2>&1
+# 预期：零错误
+# 如果有错误，这是发现问题的最佳时机——还没 npm install，修复类型错误成本低
+```
+
+> ⚠️ 网页仍不可运行。此时所有新代码已就绪，但旧 .jsx/.js 文件还在，且未 npm install 新依赖。下一步 Step 7 改 CSS（不影响类型），Step 8 删除旧文件 + npm install 后即可运行。
 
 ---
 
@@ -1649,7 +1871,7 @@ createRoot(document.getElementById('root')!).render(<App />)
 
 ## Step 8: 删除旧文件
 
-在所有 `.tsx`/`.ts` 文件创建完毕且编译通过后，删除以下旧文件：
+在所有 `.tsx`/`.ts` 文件创建完毕且 T6 类型检查通过后，删除以下旧文件：
 
 ```
 client/src/App.jsx
@@ -1663,44 +1885,44 @@ client/vite.config.js          （已被 vite.config.ts 替代）
 server/index.js                （已被 server/src/server.ts 替代）
 ```
 
+> 删除后确认 `client/src/` 下不再有任何 `.jsx`/`.js` 文件，`server/src/` 下只有 `server.ts`。如果 Vite 配置目录下 `vite.config.js` 和 `vite.config.ts` 同时存在，Vite 优先加载 `.ts`，但最好删除旧的避免混淆。
+
 ---
 
 ## Step 9: 安装依赖 + 编译验证 + 运行测试
 
-### 9.1 安装依赖
+### ✅ 验证点 V2：安装依赖 + 编译验证
 
 ```bash
-# 服务端
+# ── 服务端 ──
 cd server
-npm install
+npm install              # 安装 TS 工具链 + y-websocket v2 + 类型声明
+npx tsc --noEmit       # 类型检查（应零错误）
+npm run dev             # 启动后端 → http://localhost:3001
 
-# 客户端
+# ── 客户端 ──
 cd client
-npm install
+npm install              # 安装 TipTap + React 18 + TS 工具链
+npx tsc --noEmit       # 全量类型检查（应零错误）
 ```
 
-### 9.2 TypeScript 编译验证
+验证清单：
+- [ ] `server` 的 `npx tsc --noEmit` 零错误
+- [ ] `client` 的 `npx tsc --noEmit` 零错误
+- [ ] `server` 的 `npm run dev` 控制台输出 `[server] Running on http://localhost:3001`
+- [ ] `client` 的 `npm run dev` 控制台无报错，Vite 输出 `Local: http://localhost:5173/`
+
+> ⚠️ 如果 `npx tsc --noEmit` 报错：回到对应 Step 修复。常见问题：
+> - `Cannot find module '@tiptap/react'` → 检查 npm install 是否成功
+> - `Property 'setFontSize' does not exist` → 检查 FontSize.ts 的 `declare module`
+> - docx 类型不匹配 → 用 `as any` 断言或安装 `@types` 补充
+
+### ✅ 验证点 V3：运行验证
 
 ```bash
-# 服务端
-cd server
-npx tsc --noEmit    # 类型检查（不输出文件）
-
-# 客户端
-cd client
-npx tsc --noEmit    # 类型检查
-```
-
-### 9.3 运行验证
-
-```bash
-# 启动后端
-cd server
-npm run dev         # ts-node src/server.ts
-
-# 启动前端（另一个终端）
-cd client
-npm run dev         # vite
+# 两个终端分别启动
+cd server && npm run dev    # 终端 1：后端 3001
+cd client && npm run dev    # 终端 2：前端 5173
 ```
 
 ### 9.4 功能验证清单
@@ -1724,12 +1946,14 @@ npm run dev         # vite
 - [ ] DOCX 导出正常（包含格式）
 - [ ] 文档标题编辑 + 跨标签同步
 - [ ] 编辑/查看模式切换
-- [ ] 开两个标签打开同一文档：
-  - [ ] 实时同步正常（输入立即出现在另一标签）
+- [ ] 开两个**不同浏览器**（如 Chrome + Edge）打开同一文档：
+  - [ ] 实时同步正常（输入立即出现在另一浏览器）
   - [ ] 远程光标显示（颜色 + 用户名标签）
   - [ ] 协作者头像列表显示其他用户
   - [ ] 连接状态显示 Connected
 - [ ] 刷新页面后内容不丢失（IndexedDB 离线缓存）
+
+> ⚠️ **用两个不同浏览器测试**（不要用同一浏览器的两个标签），以排除 BroadcastChannel 同源跨标签干扰——这能确保验证的是真正的 Yjs WebSocket 同步而非本地通道回声。
 
 ---
 
