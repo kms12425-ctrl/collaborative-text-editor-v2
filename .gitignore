@@ -1,10 +1,11 @@
 # dependencies
 node_modules/
 
-# env files
+# env files — 保留 .env.template / .env.example 作为模板
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.template
+!.env.example
 
 # build folders
 dist/
