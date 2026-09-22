@@ -54,3 +54,52 @@ export interface DocumentAbilities {
   canViewHistory?: boolean
   // 后续可扩展更多能力字段...
 }
+
+// ── 用户信息（从 API 返回）──
+export interface User {
+  id: string
+  username: string
+  displayName: string
+  avatarColor: string
+}
+
+// ── RBAC 角色（对标 server/src/types.ts 的 Role）──
+export const Role = {
+  READER: 'reader',
+  COMMENTER: 'commenter',
+  EDITOR: 'editor',
+  ADMIN: 'administrator',
+  OWNER: 'owner',
+} as const
+export type Role = typeof Role[keyof typeof Role]
+
+// ── 版本快照元数据 ──
+export interface SnapshotMeta {
+  _id: string
+  name: string
+  authorName: string
+  preview: string
+  createdAt: number
+}
+
+// ── 文档访问记录 ──
+export interface DocumentAccess {
+  _id?: string
+  userId: string
+  username: string
+  role: Role
+  invitedAt?: number
+  acceptedAt?: number | null
+}
+
+// ── 评论 ──
+export interface Comment {
+  _id: string
+  documentId: string
+  userId: string
+  authorName: string
+  body: string
+  resolved: boolean
+  createdAt: number
+  updatedAt: number
+}
