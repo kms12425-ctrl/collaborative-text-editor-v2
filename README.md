@@ -1,13 +1,72 @@
 # Collaborative Docs
 
-> A real-time, multi-user document editor inspired by Google Docs — built with React, Quill, Yjs CRDTs, and WebSockets.
+> A real-time, multi-user document editor inspired by Google Docs — built with React + TipTap, Yjs CRDTs, Express/WebSocket, and MongoDB.
 
-![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
-![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite&logoColor=white)
-![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
-![Socket.IO](https://img.shields.io/badge/Socket.IO-4-010101?logo=socket.io&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-6-646CFF?logo=vite&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-22-339933?logo=node.js&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
+![TipTap](https://img.shields.io/badge/TipTap-2-0EA5E9)
 ![Yjs](https://img.shields.io/badge/Yjs-CRDT-FF6B35)
+![MongoDB](https://img.shields.io/badge/MongoDB-7-47A248?logo=mongodb&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
+
+---
+
+## 🚀 快速开始（Quick Start）
+
+当前主线实现位于 `client/`（React + Vite + TipTap）与 `server/`（Express + ws + MongoDB）。
+
+### 方式一：Docker 一键启动（推荐）
+
+```bash
+cp .env.example .env      # 可选：覆盖端口、JWT 密钥
+# PowerShell: Copy-Item .env.example .env
+docker compose up --build # → http://localhost:3001
+```
+
+- 单镜像同源部署：Express 同时提供前端静态资源与 `/api`、`/yjs`、`/ws`（见 `server/src/server.ts`）
+- 健康检查：`curl http://localhost:3001/health` → `{"status":"ok",...}`
+- 数据落在 Docker volume `mongo-data`；`docker compose down -v` 可清空
+- 宿主 3001 被本地 dev 占用时：`APP_PORT=8080 docker compose up --build`
+
+### 方式二：本地开发（热更新）
+
+```bash
+# 1) MongoDB（任选其一：本地装/容器）
+docker run -d --name mongo -p 27017:27017 mongo:7
+
+# 2) 后端 :3001
+cd server && npm ci && npm run dev
+
+# 3) 前端 :5173（Vite 代理 /api、/yjs、/ws 到 :3001）
+cd client && npm ci && npm run dev
+```
+
+访问 <http://localhost:5173>。
+
+### 测试
+
+```bash
+cd server && npm test          # Vitest（mongodb-memory-server，不动本地库）
+cd client && npm test          # Vitest + Testing Library
+cd client && npm run test:e2e  # Playwright（自动拉起 dev 双服务）
+
+# 针对已部署的栈跑 e2e：
+#   bash: PLAYWRIGHT_BASE_URL=http://localhost:3001 npx playwright test
+#   PowerShell: $env:PLAYWRIGHT_BASE_URL="http://localhost:3001"; npx playwright test
+docker compose -f compose.yml -f compose.e2e.yml run --rm e2e   # 或在容器内跑
+```
+
+### 分离部署（可选）
+
+```bash
+docker compose -f compose.split.yml up --build   # nginx(:8080) + node(:3001) + mongo
+```
+
+> 构建镜像时若 Docker Desktop 刚重启过，可能因继承 Windows 系统代理而拉不动镜像/装依赖：
+> 先临时关闭系统代理并重启 Docker（`docker info` 看到内部代理 `http.docker.internal:3128` 即正常）。
 
 ---
 
